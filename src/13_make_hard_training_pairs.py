@@ -1,9 +1,13 @@
 import pandas as pd
 import re
+import os
+import gc
+
 from collections import defaultdict
 
+
 # ============================================================
-# SETTINGS
+# FILES
 # ============================================================
 
 S1_FILE = "dataset/processed/train_source1.tsv"
@@ -16,38 +20,119 @@ OUT_FILE = "dataset/processed/training_pairs_hard.tsv"
 S1_SAMPLE = 50000
 CHUNK_SIZE = 250000
 
-# Maximum hard negatives per S1
-NEG_PER_S1 = 4
+# Same idea as test candidate generation
+MAX_PER_BLOCK = 15
+
+# Hard negatives per Source-1
+NEG_PER_S1 = 8
 
 
 # ============================================================
-# HELPERS
+# NORMALIZATION
 # ============================================================
 
-def compact(x):
+LEGAL_WORDS = {
+    "corporation": "corp",
+    "incorporated": "inc",
+    "limited": "ltd",
+    "company": "co",
+    "private": "pvt",
+}
+
+
+def normalize_name(x):
+
     if pd.isna(x):
         return ""
-    return re.sub(r"[^a-z0-9]", "", str(x).lower())
+
+    x = str(x).lower()
+
+    for old, new in LEGAL_WORDS.items():
+        x = x.replace(old, new)
+
+    x = re.sub(
+        r"[^a-z0-9\s]",
+        " ",
+        x
+    )
+
+    x = re.sub(
+        r"\s+",
+        " ",
+        x
+    ).strip()
+
+    return x
+
+
+def compact_name(x):
+    return normalize_name(x).replace(
+        " ",
+        ""
+    )
 
 
 def first_token(x):
-    if pd.isna(x):
+
+    x = normalize_name(x)
+
+    if not x:
         return ""
-    x = str(x).lower().strip()
-    return x.split()[0] if x else ""
+
+    return x.split()[0]
 
 
 def address_digits(x):
+
     if pd.isna(x):
         return ""
-    return "".join(re.findall(r"\d+", str(x)))
+
+    nums = re.findall(
+        r"\d+",
+        str(x)
+    )
+
+    return "".join(nums)
+
+
+def exact_name_key(
+    country,
+    name
+):
+
+    return (
+        str(country).lower().strip()
+        + "|"
+        + compact_name(name)
+    )
+
+
+def combo_key(
+    country,
+    address,
+    name
+):
+
+    digits = address_digits(address)
+    token = first_token(name)
+
+    if len(digits) < 2 or not token:
+        return ""
+
+    return (
+        str(country).lower().strip()
+        + "|"
+        + digits
+        + "|"
+        + token
+    )
 
 
 # ============================================================
 # LOAD S1 SAMPLE
 # ============================================================
 
-print("Loading Source 1...")
+print("Loading Source 1 sample...")
 
 s1 = pd.read_csv(
     S1_FILE,
@@ -62,27 +147,14 @@ s1 = pd.read_csv(
     ]
 ).fillna("")
 
-s1["country"] = (
-    s1["country"]
-    .str.lower()
-    .str.strip()
+s1_ids = set(
+    s1["entity_id"]
 )
 
-s1["name_key"] = (
-    s1["country"]
-    + "|"
-    + s1["business_name"].map(first_token)
+print(
+    "S1 sample:",
+    len(s1)
 )
-
-s1["addr_key"] = (
-    s1["country"]
-    + "|"
-    + s1["business_address"].map(address_digits)
-)
-
-s1_id_set = set(s1["entity_id"])
-
-print("S1 sample:", len(s1))
 
 
 # ============================================================
@@ -98,17 +170,27 @@ gt = pd.read_csv(
 ).fillna("")
 
 gt = gt[
-    gt["source1_entity_id"].isin(s1_id_set)
+    gt["source1_entity_id"].isin(
+        s1_ids
+    )
 ]
 
-true_ids = defaultdict(set)
+
+# ============================================================
+# TRUE MATCHES
+# ============================================================
+
+true_matches = defaultdict(set)
 
 positive_rows = []
 
 for row in gt.itertuples(index=False):
 
-    s1_id = row.source1_entity_id
-    value = str(row.matched_entity_ids).strip()
+    sid = row.source1_entity_id
+
+    value = str(
+        row.matched_entity_ids
+    ).strip()
 
     if not value:
         continue
@@ -118,11 +200,17 @@ for row in gt.itertuples(index=False):
         cid = cid.strip()
 
         if cid:
-            true_ids[s1_id].add(cid)
+
+            true_matches[sid].add(cid)
 
             positive_rows.append(
-                (s1_id, cid, 1)
+                (
+                    sid,
+                    cid,
+                    1
+                )
             )
+
 
 print(
     "Positive pairs:",
@@ -131,136 +219,96 @@ print(
 
 
 # ============================================================
-# REQUIRED BLOCK KEYS
+# BUILD TEST-STYLE BLOCK INDEX
 # ============================================================
 
-needed_name_keys = set(
-    s1["name_key"]
-)
-
-needed_addr_keys = set(
-    s1["addr_key"]
-)
-
-# Remove empty keys
-needed_name_keys.discard("|")
-needed_addr_keys.discard("|")
+name_index = defaultdict(list)
+combo_index = defaultdict(list)
 
 
-# ============================================================
-# BUILD CANDIDATE POOLS
-# ============================================================
+def add_to_index(
+    index,
+    key,
+    entity_id
+):
 
-name_pool = defaultdict(list)
-addr_pool = defaultdict(list)
+    if not key:
+        return
 
-print()
-print("Scanning Source 2 + Source 3 for hard negatives...")
+    values = index[key]
+
+    # Prevent huge blocks
+    if len(values) < MAX_PER_BLOCK:
+
+        values.append(
+            entity_id
+        )
 
 
-def scan_source(file_path, source_name):
+def scan_source(
+    path,
+    source_name
+):
 
     print()
-    print("Scanning", source_name)
+    print(
+        "Indexing",
+        source_name
+    )
 
-    for chunk_no, chunk in enumerate(
-        pd.read_csv(
-            file_path,
-            sep="\t",
-            dtype=str,
-            chunksize=CHUNK_SIZE,
-            usecols=[
-                "entity_id",
-                "business_name",
-                "business_address",
-                "country"
-            ]
-        ),
-        start=1
+    count = 0
+
+    for chunk in pd.read_csv(
+        path,
+        sep="\t",
+        dtype=str,
+        chunksize=CHUNK_SIZE,
+        usecols=[
+            "entity_id",
+            "business_name",
+            "business_address",
+            "country"
+        ]
     ):
 
         chunk = chunk.fillna("")
 
-        country = (
-            chunk["country"]
-            .str.lower()
-            .str.strip()
-        )
+        for row in chunk.itertuples(
+            index=False
+        ):
 
-        name_keys = (
-            country
-            + "|"
-            + chunk["business_name"].map(first_token)
-        )
+            eid = row.entity_id
 
-        addr_keys = (
-            country
-            + "|"
-            + chunk["business_address"].map(address_digits)
-        )
+            nk = exact_name_key(
+                row.country,
+                row.business_name
+            )
 
-        # ----------------------------------------------------
-        # NAME BLOCK
-        # ----------------------------------------------------
+            ck = combo_key(
+                row.country,
+                row.business_address,
+                row.business_name
+            )
 
-        name_mask = name_keys.isin(
-            needed_name_keys
-        )
+            add_to_index(
+                name_index,
+                nk,
+                eid
+            )
 
-        if name_mask.any():
+            add_to_index(
+                combo_index,
+                ck,
+                eid
+            )
 
-            selected = chunk.loc[
-                name_mask,
-                ["entity_id"]
-            ]
+            count += 1
 
-            selected_keys = name_keys[
-                name_mask
-            ]
+        if count % 1000000 < CHUNK_SIZE:
 
-            for key, entity_id in zip(
-                selected_keys,
-                selected["entity_id"]
-            ):
-
-                if len(name_pool[key]) < 10:
-                    name_pool[key].append(
-                        entity_id
-                    )
-
-        # ----------------------------------------------------
-        # ADDRESS BLOCK
-        # ----------------------------------------------------
-
-        addr_mask = addr_keys.isin(
-            needed_addr_keys
-        )
-
-        if addr_mask.any():
-
-            selected = chunk.loc[
-                addr_mask,
-                ["entity_id"]
-            ]
-
-            selected_keys = addr_keys[
-                addr_mask
-            ]
-
-            for key, entity_id in zip(
-                selected_keys,
-                selected["entity_id"]
-            ):
-
-                if len(addr_pool[key]) < 10:
-                    addr_pool[key].append(
-                        entity_id
-                    )
-
-        if chunk_no % 10 == 0:
             print(
-                "  chunks processed:",
-                chunk_no
+                "  indexed:",
+                f"{count:,}"
             )
 
 
@@ -276,86 +324,111 @@ scan_source(
 
 
 # ============================================================
-# CREATE HARD NEGATIVES
+# CREATE TRAINING PAIRS
 # ============================================================
 
 print()
-print("Creating hard negatives...")
+print("Creating aligned hard negatives...")
 
-hard_negative_rows = []
 
-for row in s1.itertuples(index=False):
+all_rows = list(
+    positive_rows
+)
 
-    s1_id = row.entity_id
+negative_count = 0
 
-    true_set = true_ids.get(
-        s1_id,
+for row in s1.itertuples(
+    index=False
+):
+
+    sid = row.entity_id
+
+    true_set = true_matches.get(
+        sid,
         set()
     )
 
-    candidates = []
+    # --------------------------------------------------------
+    # EXACT NAME BLOCK
+    # --------------------------------------------------------
 
-    # First-token candidates
-    candidates.extend(
-        name_pool.get(
-            row.name_key,
+    nk = exact_name_key(
+        row.country,
+        row.business_name
+    )
+
+    # --------------------------------------------------------
+    # NAME + ADDRESS-DIGITS BLOCK
+    # --------------------------------------------------------
+
+    ck = combo_key(
+        row.country,
+        row.business_address,
+        row.business_name
+    )
+
+    # --------------------------------------------------------
+    # UNION
+    # --------------------------------------------------------
+
+    candidate_ids = []
+
+    candidate_ids.extend(
+        name_index.get(
+            nk,
             []
         )
     )
 
-    # Address-digit candidates
-    candidates.extend(
-        addr_pool.get(
-            row.addr_key,
+    candidate_ids.extend(
+        combo_index.get(
+            ck,
             []
         )
     )
 
+    # Deduplicate
     seen = set()
 
-    for cid in candidates:
+    unique_candidates = []
 
-        if cid in seen:
-            continue
+    for cid in candidate_ids:
 
-        seen.add(cid)
+        if cid not in seen:
 
-        # Never use a true positive as a negative
+            seen.add(cid)
+            unique_candidates.append(cid)
+
+    # --------------------------------------------------------
+    # HARD NEGATIVES
+    # --------------------------------------------------------
+
+    added = 0
+
+    for cid in unique_candidates:
+
+        # Never label a true match negative
         if cid in true_set:
             continue
 
-        hard_negative_rows.append(
+        all_rows.append(
             (
-                s1_id,
+                sid,
                 cid,
                 0
             )
         )
 
-        if (
-            len([
-                x for x in hard_negative_rows
-                if x[0] == s1_id
-            ])
-            >= NEG_PER_S1
-        ):
+        negative_count += 1
+        added += 1
+
+        if added >= NEG_PER_S1:
             break
 
 
 # ============================================================
 # DATAFRAME
 # ============================================================
-
-print(
-    "Hard negative pairs:",
-    len(hard_negative_rows)
-)
-
-
-all_rows = (
-    positive_rows
-    + hard_negative_rows
-)
 
 pairs = pd.DataFrame(
     all_rows,
@@ -366,7 +439,6 @@ pairs = pd.DataFrame(
     ]
 )
 
-# Remove duplicates
 pairs = pairs.drop_duplicates(
     subset=[
         "source1_entity_id",
@@ -378,12 +450,19 @@ pairs = pairs.drop_duplicates(
 pairs = pairs.sample(
     frac=1,
     random_state=42
-).reset_index(drop=True)
+).reset_index(
+    drop=True
+)
 
 
 # ============================================================
 # SAVE
 # ============================================================
+
+os.makedirs(
+    "dataset/processed",
+    exist_ok=True
+)
 
 pairs.to_csv(
     OUT_FILE,
@@ -391,9 +470,14 @@ pairs.to_csv(
     index=False
 )
 
+
+# ============================================================
+# FINAL
+# ============================================================
+
 print()
 print("==============================================")
-print("HARD TRAINING PAIRS COMPLETED")
+print("ALIGNED TRAINING PAIRS COMPLETED")
 print("==============================================")
 
 print(
@@ -403,12 +487,26 @@ print(
 
 print(
     "Positive:",
-    (pairs["label"] == 1).sum()
+    int(
+        (pairs["label"] == 1).sum()
+    )
 )
 
 print(
     "Negative:",
-    (pairs["label"] == 0).sum()
+    int(
+        (pairs["label"] == 0).sum()
+    )
+)
+
+print(
+    "Positive ratio:",
+    round(
+        (
+            pairs["label"] == 1
+        ).mean(),
+        4
+    )
 )
 
 print(
